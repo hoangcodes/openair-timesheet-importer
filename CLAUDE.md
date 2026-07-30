@@ -574,3 +574,34 @@ Preferences
 - Dead code: `findOpenCodePendingTask` (unused now), `fillClientEngagements` (still unused).
 - Re-zip for CWS: surprise/gifs are BACK, so the store listing/justifications differ from session 11
   (remote gif images from emoji.gg CDN again — not remote code, but note it for review).
+
+## SESSION STATE — session 13 (cross-month false positive fix)
+
+- **BUG (reported live):** on 2026-07-27 a user viewing the **Jul 19–25** timesheet (single month)
+  got the modal warning "this timesheet spans two months (jul 26 - aug 1)…". Root cause: `detectCrossMonth`
+  path #1 (page innerText regex requiring literal `MM/DD/YYYY to MM/DD/YYYY`) did NOT match the live
+  SuiteProjects Pro header, path #2 (sheet tab name M-D-YYYY) didn't match either, so it fell to path #3
+  = **today's Sun–Sat week**. Today (Jul 27) sits in Jul 26–Aug 1, which straddles a month boundary →
+  bogus cross-month warning. The today fallback was masquerading as the displayed period.
+- **FIX:** `detectCrossMonth` REWRITTEN to reflect the timesheet actually OPEN on the page, never today.
+  Four sources, most-authoritative first:
+  - `_readGridWeekDates()` (PRIMARY) — finds a day-hours input (`[id^="ts_c3_r"]` Sun / `[id^="ts_c9_r"]`
+    Sat), `.closest('table')` to the grid, parses dates from header cells (`thead th/td, th`) via
+    `_extractDates`, returns earliest→latest (≤8-day span guard).
+  - `_readHeaderWeek()` — broadened page-text regex: numeric `M/D/YYYY` ranges, month-name ranges
+    ("Jul 19, 2026 - Jul 25, 2026", 2nd side may omit month), day-first, "Week of 07/19/2026", en/em/
+    ellipsis dashes + to/through/thru.
+  - `_parseSheetNameDate(sheetName)` — the old path-2 logic extracted.
+  - **LAST RESORT = today → returns `{isCross:false}`.** A cross-month warning is NEVER raised from
+    today's calendar week alone (that was the exact false positive).
+  - New helpers (all inside the IIFE, no globals): `_MONTHS_ABBR`, `_mkDate`, `_sundayToSaturday`,
+    `_parseSheetNameDate`, `_extractDates`, `_weekFromDates`, `_readGridWeekDates`, `_readHeaderWeek`.
+  - Return shape unchanged (`{isCross:true,from,to}` / `{isCross:false}`); `formatCrossMonthDates` and
+    all three callers untouched. CROSS_MONTH_ENABLED gating untouched.
+- **Validated:** `node --check content.js` passes; Node harness confirmed Jul 19–25 → not cross,
+  nothing-detectable → not cross, genuine Aug 30–Sep 5 (month-name/numeric/"Week of"/sheet-name) → cross.
+- **⚠️ UNVERIFIED live:** assumes the grid `<table>` renders per-day dates as text in its `<th>`/`<thead>`
+  header cells (e.g. "Sun 7/19"). If SuiteProjects Pro shows only bare day numbers or dates outside `<th>`,
+  `_readGridWeekDates` returns null and `_readHeaderWeek` takes over — degrades gracefully. Confirm the grid
+  header date format against a real timesheet page next live session.
+- Edits done via python/bash heredoc (Edit/Write still truncate here).

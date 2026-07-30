@@ -268,41 +268,187 @@
 
   // ── Cross-month detection ──────────────────────────────────────────────────
 
-  function detectCrossMonth(sheetName) {
-    // 1) PREFER the week actually shown on the OpenAir page. SuiteProjects Pro renders the timesheet
-    //    period as "MM/DD/YYYY to MM/DD/YYYY" in the page header, so find that range and compare the
-    //    two months. This reflects the timesheet you have OPEN (e.g. an 8/30 week), not today.
+  // Month index by 3-letter abbreviation (used to parse "Jul 19, 2026" style headers).
+  var _MONTHS_ABBR = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
+
+  function _mkDate(y, mo, d) {
+    var dt = new Date(y, mo, d);
+    if (isNaN(dt.getTime())) return null;
+    // Guard against JS date rollover (e.g. Feb 31 -> Mar 3).
+    if (dt.getMonth() !== ((mo % 12) + 12) % 12 || dt.getDate() !== d) return null;
+    return dt;
+  }
+
+  // Given any day in a week, return that week's Sunday..Saturday.
+  function _sundayToSaturday(base) {
+    var sun = new Date(base); sun.setDate(base.getDate() - base.getDay());
+    var sat = new Date(sun);  sat.setDate(sun.getDate() + 6);
+    return { from: sun, to: sat };
+  }
+
+  // Parse the imported sheet TAB NAME (e.g. "7-12-2026" = M-D-YYYY, the week-start).
+  function _parseSheetNameDate(sheetName) {
+    var m = String(sheetName || '').match(/^\s*(\d{1,2})-(\d{1,2})-(\d{4})/);
+    if (!m) return null;
+    var mo = parseInt(m[1], 10) - 1, d = parseInt(m[2], 10), y = parseInt(m[3], 10);
+    return _mkDate(y, mo, d);
+  }
+
+  // Extract every date-like token from a string, in the many formats SuiteProjects Pro
+  // / OpenAir uses for headers. Returns [{ dt, hasYear, mo, d }]. defaultYear is used only
+  // when a token omits the year (display uses month+day only, so this is safe).
+  function _extractDates(text, defaultYear) {
+    var out = [], m, mo, d, y, hasY, dt;
+    if (!text) return out;
+
+    // numeric: M/D, M/D/YY, M/D/YYYY  (slash or dash separators)
+    var reNum = /(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/g;
+    while ((m = reNum.exec(text))) {
+      mo = parseInt(m[1], 10) - 1; d = parseInt(m[2], 10);
+      hasY = !!m[3]; y = hasY ? parseInt(m[3], 10) : defaultYear;
+      if (hasY && y < 100) y += 2000;
+      if (mo < 0 || mo > 11 || d < 1 || d > 31) continue;
+      dt = _mkDate(y, mo, d);
+      if (dt) out.push({ dt: dt, hasYear: hasY, mo: mo, d: d });
+    }
+
+    // month-name first: "Jul 19", "Jul 19, 2026", "July 19 2026"
+    var reMon = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:\s*,?\s*(\d{4}))?/gi;
+    while ((m = reMon.exec(text))) {
+      mo = _MONTHS_ABBR[m[1].toLowerCase()]; d = parseInt(m[2], 10);
+      hasY = !!m[3]; y = hasY ? parseInt(m[3], 10) : defaultYear;
+      if (d < 1 || d > 31) continue;
+      dt = _mkDate(y, mo, d);
+      if (dt) out.push({ dt: dt, hasYear: hasY, mo: mo, d: d });
+    }
+
+    // day first: "19 Jul", "19 Jul 2026"
+    var reDay = /\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?(?:\s+(\d{4}))?/gi;
+    while ((m = reDay.exec(text))) {
+      d = parseInt(m[1], 10); mo = _MONTHS_ABBR[m[2].toLowerCase()];
+      hasY = !!m[3]; y = hasY ? parseInt(m[3], 10) : defaultYear;
+      if (d < 1 || d > 31) continue;
+      dt = _mkDate(y, mo, d);
+      if (dt) out.push({ dt: dt, hasYear: hasY, mo: mo, d: d });
+    }
+
+    return out;
+  }
+
+  // Turn a collection of extracted dates into a {from,to} week, if they look like a
+  // single displayed week (earliest..latest, spanning at most ~8 days).
+  function _weekFromDates(dates) {
+    if (!dates || dates.length < 2) return null;
+    var sorted = dates.slice().sort(function (a, b) { return a.dt - b.dt; });
+    var from = sorted[0].dt, to = sorted[sorted.length - 1].dt;
+    var span = Math.round((to.getTime() - from.getTime()) / 86400000);
+    if (span < 0 || span > 8) return null;
+    return { from: from, to: to };
+  }
+
+  // PRIMARY source of truth: the dates rendered in the timesheet grid's day-column headers.
+  // The hours inputs are ts_c3_r{n}..ts_c9_r{n} (Sun..Sat); we locate the grid <table> from
+  // one of those inputs and read date tokens out of its HEADER cells only (th / thead), so we
+  // reflect exactly the week the user has OPEN rather than today's date.
+  // ASSUMPTION (verify on a live page): the grid table exposes the per-day dates as text in its
+  // <th>/<thead> header cells. If it does not, this returns null and we fall through to the
+  // broadened page-header regex below.
+  function _readGridWeekDates() {
+    try {
+      var dayInput = document.querySelector('[id^="ts_c3_r"]') ||
+                     document.querySelector('[id^="ts_c9_r"]');
+      var table = (dayInput && dayInput.closest) ? dayInput.closest('table') : null;
+      if (!table) return null;
+
+      var headerText = '';
+      var cells = table.querySelectorAll('thead th, thead td, th');
+      if (cells && cells.length) {
+        cells.forEach(function (c) { headerText += ' ' + (c.textContent || ''); });
+      }
+      if (!headerText.trim()) return null;
+
+      return _weekFromDates(_extractDates(headerText, (new Date()).getFullYear()));
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  // SECONDARY source: the page/header text. Accepts full ranges in many formats
+  // ("07/19/2026 - 07/25/2026", "Jul 19, 2026 to Jul 25, 2026", "Jul 19 - 25, 2026", en/em dashes,
+  // "to"/"through"/"thru"), and a lone week-start ("Week of 07/19/2026") from which the Sun..Sat
+  // week is computed.
+  function _readHeaderWeek() {
     try {
       var pageText = (document.body && document.body.innerText) || '';
-      var rm = pageText.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s*(?:to|through|\u2013|\u2014|-)\s*(\d{1,2})\/(\d{1,2})\/(\d{4})/i);
-      if (rm) {
-        var pf = new Date(+rm[3], +rm[1] - 1, +rm[2]);
-        var pt = new Date(+rm[6], +rm[4] - 1, +rm[5]);
-        if (!isNaN(pf.getTime()) && !isNaN(pt.getTime())) {
-          if (pf.getMonth() !== pt.getMonth() || pf.getFullYear() !== pt.getFullYear()) {
-            return { isCross: true, from: pf, to: pt };
-          }
-          return { isCross: false };
-        }
-      }
-    } catch (_e) {}
+      if (!pageText) return null;
+      var year = (new Date()).getFullYear();
+      var m, a, b;
+      var SEP = '(?:to|through|thru|\\u2013|\\u2014|\\u2026|-)';
 
-    // 2) FALLBACK: the imported sheet TAB NAME (e.g. "7-12-2026" = M-D-YYYY, the week-start).
-    // 3) FINAL fallback: today's week.
-    var base = null;
-    var m = String(sheetName || '').match(/^\s*(\d{1,2})-(\d{1,2})-(\d{4})/);
-    if (m) {
-      var mo = parseInt(m[1], 10) - 1, d = parseInt(m[2], 10), y = parseInt(m[3], 10);
-      var dt = new Date(y, mo, d);
-      if (!isNaN(dt.getTime()) && dt.getMonth() === mo && dt.getDate() === d) base = dt;
+      // "Week of <date>" -> compute that week's Sun..Sat.
+      var wm = pageText.match(/week\s+of\s+([^\n\r]{0,24})/i);
+      if (wm) {
+        var wd = _extractDates(wm[1], year);
+        if (wd.length) return _sundayToSaturday(wd[0].dt);
+      }
+
+      // Numeric range: "M/D[/Y] <sep> M/D[/Y]".
+      m = pageText.match(new RegExp(
+        '(\\d{1,2}[\\/\\-]\\d{1,2}(?:[\\/\\-]\\d{2,4})?)\\s*' + SEP +
+        '\\s*(\\d{1,2}[\\/\\-]\\d{1,2}(?:[\\/\\-]\\d{2,4})?)', 'i'));
+      if (m) {
+        a = _extractDates(m[1], year)[0];
+        b = _extractDates(m[2], year)[0];
+        if (a && b) return { from: a.dt, to: b.dt };
+      }
+
+      // Month-name range: "Mon D[, Y] <sep> [Mon ]D[, Y]" (second side may omit the month).
+      var MON = '(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?';
+      m = pageText.match(new RegExp(
+        '(' + MON + '\\s+\\d{1,2}(?:\\s*,?\\s*\\d{4})?)\\s*' + SEP +
+        '\\s*((?:' + MON + '\\s+)?\\d{1,2}(?:\\s*,?\\s*\\d{4})?)', 'i'));
+      if (m) {
+        a = _extractDates(m[1], year)[0];
+        b = _extractDates(m[2], year)[0];
+        if (a && !b) {
+          // Second side had no month word (e.g. "25, 2026") -> inherit month from first side.
+          var dm = m[2].match(/(\d{1,2})/);
+          var ym = m[2].match(/(\d{4})/);
+          if (dm) {
+            var yr = ym ? parseInt(ym[1], 10) : (a.hasYear ? a.dt.getFullYear() : year);
+            var bd = _mkDate(yr, a.mo, parseInt(dm[1], 10));
+            if (bd) b = { dt: bd };
+          }
+        }
+        if (a && b) return { from: a.dt, to: b.dt };
+      }
+
+      return null;
+    } catch (_e) {
+      return null;
     }
-    if (!base) base = new Date();
-    var sunday   = new Date(base);
-    sunday.setDate(base.getDate() - base.getDay());
-    var saturday = new Date(sunday);
-    saturday.setDate(sunday.getDate() + 6);
-    if (sunday.getMonth() !== saturday.getMonth()) {
-      return { isCross: true, from: sunday, to: saturday };
+  }
+
+  function detectCrossMonth(sheetName) {
+    // Detection must reflect the timesheet the user has OPEN on the page, never today's date.
+    // Sources, most authoritative first:
+    //   A) grid day-column header dates (what's rendered on screen)
+    //   B) broadened page/header date range (or "Week of …")
+    //   C) the imported sheet tab name (week-start)
+    //   D) LAST RESORT: today -> return {isCross:false}. We deliberately do NOT raise a
+    //      cross-month warning from today's calendar week alone, because that produced the
+    //      false positive this fix targets (a July-only timesheet flagged Jul 26 - Aug 1).
+    var week = _readGridWeekDates();
+    if (!week) week = _readHeaderWeek();
+    if (!week) {
+      var base = _parseSheetNameDate(sheetName);
+      if (base) week = _sundayToSaturday(base);
+    }
+    if (!week) return { isCross: false };
+
+    if (week.from.getMonth() !== week.to.getMonth() ||
+        week.from.getFullYear() !== week.to.getFullYear()) {
+      return { isCross: true, from: week.from, to: week.to };
     }
     return { isCross: false };
   }

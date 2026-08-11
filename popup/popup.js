@@ -3,8 +3,49 @@
 (function () {
   'use strict';
 
+  const OPENAIR_HOST = 'app.netsuitesuiteprojectspro.com';
+  let activeTabId = null;
+
+  // Status indicator
+  function setStatus(cls, label) {
+    document.getElementById('statusDot').className    = 'status-dot status-dot--' + cls;
+    document.getElementById('statusLabel').textContent = label;
+  }
+
+  // Send a message to the active tab's content script
+  function sendToTab(msg) {
+    return new Promise((resolve, reject) => {
+      if (!activeTabId) { reject(new Error('No active tab')); return; }
+      chrome.tabs.sendMessage(activeTabId, msg, resp => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message)); return;
+        }
+        resolve(resp);
+      });
+    });
+  }
+
   // Init
-  function init() {
+  async function init() {
+    chrome.tabs.query({ active: true, currentWindow: true }, async tabs => {
+      const tab = tabs?.[0];
+      if (!tab) { setStatus('error', 'No tab found'); return; }
+      activeTabId = tab.id;
+
+      if (!tab.url || !tab.url.includes(OPENAIR_HOST)) {
+        setStatus('warn', 'openair undetected');
+        return;
+      }
+
+      try {
+        const pong = await sendToTab({ action: 'ping' });
+        if (pong?.isTimesheetPage) setStatus('ok',   'openair detected');
+        else                       setStatus('warn', 'openair undetected');
+      } catch {
+        setStatus('warn', 'openair undetected');
+      }
+    });
+
     document.getElementById('downloadBtn').addEventListener('click', () => {
       const a = document.createElement('a');
       a.href     = chrome.runtime.getURL('template.xlsx');

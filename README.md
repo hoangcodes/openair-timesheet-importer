@@ -22,6 +22,8 @@ Everything runs locally in your browser. The extension only reads the Excel file
 4. Click **Load unpacked** and select the unzipped project folder.
 5. Open (or refresh) your OpenAir weekly timesheet page — a small **Timesheet Importer** panel appears in the bottom-right corner.
 
+OR download the extension here - <a href="https://chromewebstore.google.com/detail/openair-timesheet-importe/ageeabfdmemlbmgdgeffgknffiapenbl" target="_blank">Google Chrome Store</a>
+
 You can grab the Excel format from the extension popup (click the toolbar icon): **Download template** (blank) and **Download example** (a filled-in sample). The template is also downloadable from the bottom-right panel.
 
 ![Extension popup](docs/screenshots/00-popup.png)
